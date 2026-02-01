@@ -3,7 +3,7 @@ set -euo pipefail
 
 echo -e "\033[1;34m>>> PMESP ULTIMATE - INSTALL (TANK MODE)\033[0m"
 
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ColtSeals/antigo/main}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ColtSeals/stunnel4/main}"
 
 apt-get update -y || true
 apt-get install -y \
