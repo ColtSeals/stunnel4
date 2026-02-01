@@ -7,3 +7,6 @@ wget -O install.sh "https://raw.githubusercontent.com/ColtSeals/stunnel4/main/in
 
 
 
+wget -O install.sh "https://raw.githubusercontent.com/ColtSeals/stunnel4/main/install.sh"
+chmod +x install.sh
+sudo ./install.sh
