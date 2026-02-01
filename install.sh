@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
 set -e
 
-echo -e "\033[1;34m>>> PMESP ULTIMATE - INSTALL (V8.5 TANK)\033[0m"
+echo -e "\033[1;34m>>> PMESP ULTIMATE - INSTALL (V8.6 FULL)\033[0m"
 
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ColtSeals/stunnel4/main}"
 
 apt-get update -y || true
 apt-get install -y \
   bash jq curl wget gzip ca-certificates openssl \
-  net-tools lsof cron screen nano zip unzip \
-  stunnel4 sslh squid \
+  net-tools lsof cron screen nano zip unzip bc \
+  squid sslh stunnel4 \
   python3 python3-pip \
   msmtp msmtp-mta
 
-# API deps
 python3 -m pip install --upgrade pip >/dev/null 2>&1 || true
 python3 -m pip install fastapi uvicorn "passlib[bcrypt]" >/dev/null 2>&1 || true
 
-# Baixa manager (pmesp)
+# Baixa manager
 wget -qO /usr/local/bin/pmesp "$REPO_RAW/manager.sh"
 chmod +x /usr/local/bin/pmesp
-
-# Normaliza possível CRLF (Windows) pra evitar "pmesp volta pro prompt"
 sed -i 's/\r$//' /usr/local/bin/pmesp || true
 
 # Baixa API
@@ -36,7 +33,7 @@ mkdir -p /var/lock
 touch /var/lock/pmesp_db.lock
 chmod 666 /var/lock/pmesp_db.lock
 
-# Serviço API (auto-start) - usa python -m uvicorn (não depende de /usr/local/bin/uvicorn)
+# Serviço API
 cat > /etc/systemd/system/pmesp-api.service <<'EOF'
 [Unit]
 Description=PMESP API (FastAPI)
