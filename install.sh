@@ -22,6 +22,11 @@ chmod +x /usr/local/bin/pmesp
 mkdir -p /etc/pmesp
 wget -qO /etc/pmesp/api_pmesp.py "$REPO_RAW/api_pmesp.py"
 
+# Garante lockfile
+mkdir -p /var/lock
+touch /var/lock/pmesp_db.lock
+chmod 600 /var/lock/pmesp_db.lock
+
 # Serviço API (auto-start)
 cat > /etc/systemd/system/pmesp-api.service <<'EOF'
 [Unit]
@@ -35,6 +40,9 @@ ExecStart=/usr/local/bin/uvicorn api_pmesp:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=2
 
+# Dica: para exigir API key, crie /etc/default/pmesp-api e carregue aqui
+# EnvironmentFile=-/etc/default/pmesp-api
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -44,4 +52,4 @@ systemctl enable pmesp-api.service
 systemctl restart pmesp-api.service
 
 echo -e "\033[1;32m>>> TUDO PRONTO! Digite 'pmesp' para abrir.\033[0m"
-echo -e "\033[1;33m>>> API: http://IP_DA_VPS:8000 (veja regras/segurança no api_pmesp.py)\033[0m"
+echo -e "\033[1;33m>>> API: http://IP_DA_VPS:8000 | Health: /health\033[0m"
