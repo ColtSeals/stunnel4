@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ==================================================================
 #   PMESP MANAGER ULTIMATE V9.2 - TÁTICO + TUNNEL ARSENAL (LOCKED)
-#   DB: NDJSON (1 JSON por linha) + FILE LOCK + ATOMIC WRITE
+#   - Corrige pipefail + grep
+#   - File Locking Bash (flock)
+#   - NDJSON: /etc/pmesp_users.json (1 JSON por linha)
 # ==================================================================
 set -euo pipefail
 
@@ -11,7 +13,7 @@ DB_CHAMADOS="/etc/pmesp_tickets.json"     # NDJSON
 CONFIG_SMTP="/etc/msmtprc"
 LOG_MONITOR="/var/log/pmesp_monitor.log"
 
-# LOCK (compartilhado Bash + API)
+# LOCK GLOBAL (Bash + Python usam o mesmo)
 LOCK_FILE="/var/lock/pmesp_db.lock"
 
 # Tunnel
@@ -32,6 +34,10 @@ LINE_H="${C}═${NC}"
 have(){ command -v "$1" >/dev/null 2>&1; }
 pause(){ read -r -p "Pressione Enter para voltar..." _; }
 
+msg_ok(){   echo -e "${G}[✓]${NC} $*"; }
+msg_warn(){ echo -e "${Y}[!]${NC} $*"; }
+msg_fail(){ echo -e "${R}[X]${NC} $*"; }
+
 need_root(){
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo -e "${R}Este script precisa rodar como root.${NC}"
@@ -41,122 +47,84 @@ need_root(){
 }
 
 ensure_files(){
-  mkdir -p /var/lock
-  [ ! -f "$LOCK_FILE" ] && : > "$LOCK_FILE" && chmod 600 "$LOCK_FILE" || true
-
+  mkdir -p /var/lock /var/log /etc/pmesp 2>/dev/null || true
   [ ! -f "$DB_PMESP" ] && touch "$DB_PMESP" && chmod 666 "$DB_PMESP"
   [ ! -f "$DB_CHAMADOS" ] && touch "$DB_CHAMADOS" && chmod 666 "$DB_CHAMADOS"
   [ ! -f "$LOG_MONITOR" ] && touch "$LOG_MONITOR" && chmod 644 "$LOG_MONITOR"
+  [ ! -f "$LOCK_FILE" ] && :> "$LOCK_FILE" && chmod 666 "$LOCK_FILE"
 }
 
-# ------------------------------------------------------------
-# LOCK PRIMITIVES (Bash) - shared lock p/ leitura, exclusive p/ escrita
-# ------------------------------------------------------------
-with_db_lock(){
-  # uso: with_db_lock -s <cmd...>   (shared/read)
-  #      with_db_lock -x <cmd...>   (exclusive/write)
-  local mode="$1"; shift
+# Execução protegida por lock (exclusivo)
+with_lock(){
   (
-    flock "$mode" 200
+    flock -x 200
     "$@"
   ) 200>"$LOCK_FILE"
 }
 
-db_snapshot(){
-  # cria cópia consistente do DB sob shared lock
-  local tmp
-  tmp="$(mktemp)"
-  with_db_lock -s bash -c 'cat "$1" > "$2" 2>/dev/null || true' _ "$DB_PMESP" "$tmp"
-  echo "$tmp"
+# Leitura protegida por lock (compartilhado)
+with_lock_read(){
+  (
+    flock -s 200
+    "$@"
+  ) 200>"$LOCK_FILE"
 }
 
-db_append_line(){
-  # append consistente sob exclusive lock
-  local line="$1"
-  with_db_lock -x bash -c 'printf "%s\n" "$1" >> "$2"' _ "$line" "$DB_PMESP"
+autocura_db_users_inner(){
+  # mantém apenas JSON válido, unique_by(usuario), preserva NDJSON
+  if have jq && [ -s "$DB_PMESP" ]; then
+    local tmp_clean tmp2
+    tmp_clean="$(mktemp)"
+    while IFS= read -r line; do
+      [[ -z "${line// }" ]] && continue
+      echo "$line" | jq -e . >/dev/null 2>&1 && echo "$line" >> "$tmp_clean"
+    done < "$DB_PMESP"
+
+    tmp2="$(mktemp)"
+    jq -s 'map(select(type=="object" and has("usuario"))) | unique_by(.usuario) | .[]' -c \
+      "$tmp_clean" > "$tmp2" 2>/dev/null || true
+
+    [ -s "$tmp2" ] && mv "$tmp2" "$DB_PMESP" || true
+    rm -f "$tmp_clean" 2>/dev/null || true
+  fi
 }
 
-db_replace_atomic(){
-  # replace atômico sob exclusive lock (mv dentro do lock)
-  local src="$1"
-  with_db_lock -x bash -c 'mv -f "$1" "$2"' _ "$src" "$DB_PMESP"
-}
-
-# ------------------------------------------------------------
-# AUTO-CURA (sob lock + atomic replace)
-# ------------------------------------------------------------
 autocura_db_users(){
-  have jq || return 0
+  with_lock autocura_db_users_inner
+}
 
-  # snapshot consistente
-  local snap clean tmp_out
-  snap="$(db_snapshot)"
-  [ ! -s "$snap" ] && { rm -f "$snap" || true; return 0; }
+get_total_users(){
+  if ! have jq; then echo "0"; return; fi
+  with_lock_read bash -c "jq -s 'length' '$DB_PMESP' 2>/dev/null || echo 0"
+}
 
-  clean="$(mktemp)"
-  while IFS= read -r line; do
-    [[ -z "${line// }" ]] && continue
-    echo "$line" | jq -e . >/dev/null 2>&1 && echo "$line" >> "$clean"
-  done < "$snap"
-
-  tmp_out="$(mktemp)"
-  jq -s 'map(select(type=="object" and has("usuario"))) | unique_by(.usuario) | .[]' -c \
-    "$clean" 2>/dev/null > "$tmp_out" || true
-
-  rm -f "$snap" "$clean" 2>/dev/null || true
-  [ -s "$tmp_out" ] && db_replace_atomic "$tmp_out" || rm -f "$tmp_out" || true
+get_public_ip(){
+  if have curl; then
+    curl -fsS --max-time 2 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\n' || echo "N/A"
+  elif have wget; then
+    wget -qO- ipv4.icanhazip.com 2>/dev/null | tr -d '\n' || echo "N/A"
+  else
+    echo "N/A"
+  fi
 }
 
 cabecalho(){
   clear
   local _tuser _ons _ip
-  _tuser="$(
-    if have jq; then
-      local snap
-      snap="$(db_snapshot)"
-      jq -s 'length' "$snap" 2>/dev/null || echo "0"
-      rm -f "$snap" 2>/dev/null || true
-    else
-      echo "0"
-    fi
-  )"
-  _ons=$(who | grep -v 'root' | wc -l | tr -d ' ')
-  _ip=$(wget -qO- ipv4.icanhazip.com 2>/dev/null || echo "N/A")
+  _tuser="$(get_total_users)"
+  # >>> CORREÇÃO DEFINITIVA: sem grep + pipefail
+  _ons="$(who | awk '$1!="root"{c++} END{print c+0}')"
+  _ip="$(get_public_ip)"
 
   echo -e "${C}╭${LINE_H}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C}╮${NC}"
   echo -e "${C}┃${P}            PMESP MANAGER V9.2 - TÁTICO INTEGRADO           ${C}┃${NC}"
   echo -e "${C}┣${LINE_H}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫${NC}"
-  echo -e "${C}┃ ${Y}TOTAL: ${W}$_tuser ${Y}| ONLINE: ${G}$_ons ${Y}| IP: ${G}$_ip${C}    ┃${NC}"
+  echo -e "${C}┃ ${Y}TOTAL: ${W}${_tuser} ${Y}| ONLINE: ${G}${_ons} ${Y}| IP: ${G}${_ip}${C}    ┃${NC}"
   echo -e "${C}┗${LINE_H}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
 }
 
 barra(){ echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
-# ------------------------------------------------------------
-# STATUS API (diagnóstico real + systemd)
-# ------------------------------------------------------------
-status_api_tatica(){
-  cabecalho
-  echo -e "${P}>>> STATUS DA INTELIGÊNCIA (API)${NC}"
-  barra
-
-  if systemctl is-active --quiet pmesp-api.service; then
-    echo -e "Serviço: ${G}ONLINE${NC} (systemd)"
-  else
-    echo -e "Serviço: ${R}OFFLINE${NC}"
-  fi
-
-  echo -e "Teste interno: ${W}http://127.0.0.1:8000/health${NC}"
-  if curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1; then
-    echo -e "API: ${G}OK${NC}"
-  else
-    echo -e "API: ${R}FALHA${NC} (timeout/erro)"
-    echo -e "${Y}Dica:${NC} systemctl status pmesp-api.service"
-  fi
-  pause
-}
-
-# --- FUNÇÃO DE SELEÇÃO INTELIGENTE ---
 selecionar_usuario_lista(){
   cabecalho
   echo -e "${C}>>> SELECIONE O USUÁRIO${NC}"
@@ -167,18 +135,10 @@ selecionar_usuario_lista(){
     pause; return 1
   fi
 
-  local snap
-  snap="$(db_snapshot)"
-  if [ ! -s "$snap" ]; then
-    echo -e "${R}Nenhum usuário cadastrado.${NC}"
-    rm -f "$snap" 2>/dev/null || true
-    pause; return 1
-  fi
+  local users_list
+  mapfile -t users_list < <(with_lock_read bash -c "jq -r 'select(type==\"object\" and has(\"usuario\")) | .usuario' '$DB_PMESP' 2>/dev/null || true")
 
-  mapfile -t users_list < <(jq -r 'select(type=="object" and has("usuario")) | .usuario' "$snap" 2>/dev/null || true)
-  rm -f "$snap" 2>/dev/null || true
-
-  if [ ${#users_list[@]} -eq 0 ]; then
+  if [ "${#users_list[@]}" -eq 0 ]; then
     echo -e "${R}Banco vazio/ inválido.${NC}"
     pause; return 1
   fi
@@ -191,7 +151,6 @@ selecionar_usuario_lista(){
 
   echo ""; barra
   read -r -p "Digite o NÚMERO do usuário: " selection
-
   if [[ ! "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#users_list[@]}" ]; then
     echo -e "\n${R}ERRO: Seleção inválida!${NC}"
     sleep 1
@@ -204,10 +163,7 @@ selecionar_usuario_lista(){
   return 0
 }
 
-# ------------------------------------------------------------
-# GESTÃO DE USUÁRIOS
-# ------------------------------------------------------------
-criar_usuario(){
+criar_usuario_inner(){
   cabecalho
   echo -e "${G}>>> NOVO CADASTRO DE POLICIAL${NC}"
 
@@ -221,16 +177,13 @@ criar_usuario(){
   read -r -p "Login: " usuario
   [ -z "${usuario:-}" ] && return
 
-  # Checagem de duplicidade consistente (snapshot)
-  local snap
-  snap="$(db_snapshot)"
-  if grep -q "\"usuario\"[ ]*:[ ]*\"$usuario\"" "$snap" 2>/dev/null; then
-    rm -f "$snap" 2>/dev/null || true
+  # checa no DB
+  if jq -e "select(.usuario==\"$usuario\")" "$DB_PMESP" >/dev/null 2>&1; then
     echo -e "\n${R}ERRO: O usuário '$usuario' já existe!${NC}"
     sleep 2; return
   fi
-  rm -f "$snap" 2>/dev/null || true
 
+  # checa no linux
   if id "$usuario" >/dev/null 2>&1; then
     echo -e "\n${R}ERRO: Usuário já existe no Linux!${NC}"
     sleep 2; return
@@ -245,18 +198,24 @@ criar_usuario(){
 
   useradd -M -s /bin/false "$usuario"
   echo "$usuario:$senha" | chpasswd
-  data_exp=$(date -d "+$dias days" +"%Y-%m-%d")
+  local data_exp
+  data_exp="$(date -d "+$dias days" +"%Y-%m-%d")"
   chage -E "$data_exp" "$usuario" || true
 
-  item=$(jq -c -n --arg u "$usuario" --arg s "$senha" --arg d "$dias" --arg l "$limite" \
-    --arg m "$matricula" --arg e "$email" --arg h "PENDENTE" --arg ex "$data_exp" \
-    '{usuario:$u, senha:$s, dias:$d, limite:$l, matricula:$m, email:$e, hwid:$h, expiracao:$ex}')
+  local item
+  item="$(jq -c -n --arg u "$usuario" --arg s "$senha" --arg d "$dias" --arg l "$limite" \
+      --arg m "$matricula" --arg e "$email" --arg h "PENDENTE" --arg ex "$data_exp" \
+      '{usuario:$u, senha:$s, dias:$d, limite:$l, matricula:$m, email:$e, hwid:$h, expiracao:$ex}')"
 
-  db_append_line "$item"
-  autocura_db_users
+  echo "$item" >> "$DB_PMESP"
+  autocura_db_users_inner
 
   echo -e "\n${G}Usuário ${W}$usuario${G} criado com sucesso!${NC}"
   sleep 2
+}
+
+criar_usuario(){
+  with_lock criar_usuario_inner
 }
 
 listar_usuarios(){
@@ -271,24 +230,20 @@ listar_usuarios(){
     pause; return
   fi
 
-  local snap
-  snap="$(db_snapshot)"
-  if [ -s "$snap" ]; then
-    jq -c '.' "$snap" 2>/dev/null | while read -r line; do
-      u=$(echo "$line" | jq -r .usuario); m=$(echo "$line" | jq -r .matricula)
-      ex=$(echo "$line" | jq -r .expiracao); l=$(echo "$line" | jq -r .limite)
-      h=$(echo "$line" | jq -r .hwid)
-      printf "${Y}%-12s${NC} | %-10s | %-11s | %-4s | %-10s\n" "$u" "$m" "$ex" "$l" "${h:0:10}"
-    done
-  else
-    echo -e "${R}Nenhum usuário.${NC}"
-  fi
-  rm -f "$snap" 2>/dev/null || true
+  with_lock_read bash -c "jq -c '.' '$DB_PMESP' 2>/dev/null" | while read -r line; do
+    u=$(echo "$line" | jq -r .usuario)
+    m=$(echo "$line" | jq -r .matricula)
+    ex=$(echo "$line" | jq -r .expiracao)
+    l=$(echo "$line" | jq -r .limite)
+    h=$(echo "$line" | jq -r .hwid)
+    printf "${Y}%-12s${NC} | %-10s | %-11s | %-4s | %-10s\n" "$u" "$m" "$ex" "$l" "${h:0:10}"
+  done || true
+
   echo ""
   pause
 }
 
-remover_usuario_lista(){
+remover_usuario_inner(){
   selecionar_usuario_lista || return
 
   echo -e "${R}ATENÇÃO: Você vai remover o usuário ${W}$USER_ALVO${R}.${NC}"
@@ -297,81 +252,85 @@ remover_usuario_lista(){
 
   id "$USER_ALVO" >/dev/null 2>&1 && userdel -f "$USER_ALVO" || true
 
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
+  if have jq; then
+    local tmp
+    tmp="$(mktemp)"
+    jq -c "select(.usuario != \"$USER_ALVO\")" "$DB_PMESP" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$DB_PMESP"
+  fi
 
-  local snap tmp
-  snap="$(db_snapshot)"
-  tmp="$(mktemp)"
-  jq -c "select(.usuario != \"$USER_ALVO\")" "$snap" > "$tmp" 2>/dev/null || true
-  rm -f "$snap" 2>/dev/null || true
-
-  db_replace_atomic "$tmp"
-  autocura_db_users
-
-  echo -e "${G}Usuário removido com sucesso!${NC}"
+  msg_ok "Usuário removido com sucesso!"
   sleep 2
 }
 
-alterar_validade_lista(){
+remover_usuario_lista(){
+  with_lock remover_usuario_inner
+}
+
+alterar_validade_inner(){
   selecionar_usuario_lista || return
 
   cabecalho
   echo -e "${C}>>> ALTERANDO VALIDADE: ${Y}$USER_ALVO${NC}"
   read -r -p "Novos dias de validade: " novos_dias
 
-  [[ "$novos_dias" =~ ^[0-9]+$ ]] || { echo -e "${R}Número inválido!${NC}"; sleep 1; return; }
+  if [[ ! "$novos_dias" =~ ^[0-9]+$ ]]; then
+    echo -e "${R}Número inválido!${NC}"; sleep 1; return
+  fi
 
   if id "$USER_ALVO" >/dev/null 2>&1; then
-    local nova_data snap tmp
-    nova_data=$(date -d "+$novos_dias days" +"%Y-%m-%d")
+    local nova_data tmp
+    nova_data="$(date -d "+$novos_dias days" +"%Y-%m-%d")"
     chage -E "$nova_data" "$USER_ALVO" || true
 
-    have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
+    if have jq; then
+      tmp="$(mktemp)"
+      jq -c "if .usuario == \"$USER_ALVO\" then .expiracao = \"$nova_data\" | .dias = \"$novos_dias\" else . end" \
+        "$DB_PMESP" > "$tmp"
+      mv "$tmp" "$DB_PMESP"
+    fi
 
-    snap="$(db_snapshot)"
-    tmp="$(mktemp)"
-    jq -c "if .usuario == \"$USER_ALVO\" then .expiracao = \"$nova_data\" | .dias = \"$novos_dias\" else . end" \
-      "$snap" > "$tmp" 2>/dev/null || true
-    rm -f "$snap" 2>/dev/null || true
-
-    db_replace_atomic "$tmp"
-    autocura_db_users
-
-    echo -e "${G}Sucesso! Nova data: ${W}$nova_data${NC}"
+    msg_ok "Sucesso! Nova data: $nova_data"
   else
-    echo -e "${R}Erro: Usuário não encontrado no Linux.${NC}"
+    msg_fail "Usuário não encontrado no Linux."
   fi
   sleep 2
 }
 
-alterar_limite_lista(){
+alterar_validade_lista(){
+  with_lock alterar_validade_inner
+}
+
+alterar_limite_inner(){
   selecionar_usuario_lista || return
 
   cabecalho
   echo -e "${C}>>> ALTERANDO LIMITE: ${Y}$USER_ALVO${NC}"
+  if ! have jq; then
+    echo -e "${R}jq não instalado.${NC}"
+    pause; return
+  fi
 
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
-
-  local snap limite_atual
-  snap="$(db_snapshot)"
-  limite_atual=$(jq -r "select(.usuario==\"$USER_ALVO\") | .limite" "$snap" 2>/dev/null || echo "N/A")
-  rm -f "$snap" 2>/dev/null || true
+  local limite_atual
+  limite_atual="$(jq -r "select(.usuario==\"$USER_ALVO\") | .limite" "$DB_PMESP" 2>/dev/null || echo "N/A")"
   echo -e "Limite Atual: ${W}$limite_atual${NC}"
 
   read -r -p "Novo limite de conexões: " novo_limite
-  [[ "$novo_limite" =~ ^[0-9]+$ ]] || { echo -e "${R}Número inválido!${NC}"; sleep 1; return; }
+  if [[ ! "$novo_limite" =~ ^[0-9]+$ ]]; then
+    echo -e "${R}Número inválido!${NC}"; sleep 1; return
+  fi
 
-  snap="$(db_snapshot)"
   local tmp
   tmp="$(mktemp)"
-  jq -c "if .usuario == \"$USER_ALVO\" then .limite = \"$novo_limite\" else . end" "$snap" > "$tmp" 2>/dev/null || true
-  rm -f "$snap" 2>/dev/null || true
+  jq -c "if .usuario == \"$USER_ALVO\" then .limite = \"$novo_limite\" else . end" "$DB_PMESP" > "$tmp"
+  mv "$tmp" "$DB_PMESP"
 
-  db_replace_atomic "$tmp"
-  autocura_db_users
-
-  echo -e "${G}Limite atualizado para: ${W}$novo_limite${NC}"
+  msg_ok "Limite atualizado para: $novo_limite"
   sleep 2
+}
+
+alterar_limite_lista(){
+  with_lock alterar_limite_inner
 }
 
 usuarios_vencidos(){
@@ -379,21 +338,23 @@ usuarios_vencidos(){
   echo -e "${R}>>> USUÁRIOS VENCIDOS${NC}"
   barra
 
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
+  if ! have jq; then
+    echo -e "${R}jq não instalado.${NC}"
+    pause; return
+  fi
 
-  local today snap
-  today=$(date +%s)
-  snap="$(db_snapshot)"
+  local today
+  today="$(date +%s)"
 
-  jq -c '.' "$snap" 2>/dev/null | while read -r line; do
-    u=$(echo "$line" | jq -r .usuario); ex=$(echo "$line" | jq -r .expiracao)
+  with_lock_read bash -c "jq -c '.' '$DB_PMESP' 2>/dev/null" | while read -r line; do
+    u=$(echo "$line" | jq -r .usuario)
+    ex=$(echo "$line" | jq -r .expiracao)
     exp_sec=$(date -d "$ex" +%s 2>/dev/null || echo 0)
     if [ "$exp_sec" -lt "$today" ]; then
       echo -e "${R}$u - EXPIRADO EM $ex${NC}"
     fi
-  done
+  done || true
 
-  rm -f "$snap" 2>/dev/null || true
   pause
 }
 
@@ -403,78 +364,56 @@ mostrar_usuarios_online(){
     cabecalho
     echo -e "${C}>>> MONITORAMENTO ONLINE (CTRL+C Sair)${NC}"
     barra
-    have jq || { echo -e "${R}jq não instalado.${NC}"; sleep 2; continue; }
 
-    local snap
-    snap="$(db_snapshot)"
-    jq -s 'unique_by(.usuario) | .[]' -c "$snap" 2>/dev/null | while read -r line; do
+    if ! have jq; then
+      echo -e "${R}jq não instalado.${NC}"
+      sleep 2; continue
+    fi
+
+    with_lock_read bash -c "jq -s 'unique_by(.usuario) | .[]' -c '$DB_PMESP' 2>/dev/null" | while read -r line; do
       u=$(echo "$line" | jq -r .usuario)
       l=$(echo "$line" | jq -r .limite)
-      s=$(who | grep -w "$u" | wc -l)
+
+      # >>> CORREÇÃO DEFINITIVA: sem grep + pipefail
+      s="$(who | awk -v u="$u" '$1==u{c++} END{print c+0}')"
+
       if [ "$s" -gt 0 ]; then
         printf "${Y}%-15s${NC} | ON: %-3s | LIM: %-3s\n" "$u" "$s" "$l"
       fi
-    done
-    rm -f "$snap" 2>/dev/null || true
+    done || true
+
     sleep 2
   done
 }
 
-recuperar_senha(){
-  cabecalho
-  read -r -p "Usuário (Login): " user_alvo
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
-
-  local snap email_dest
-  snap="$(db_snapshot)"
-  email_dest=$(jq -r "select(.usuario==\"$user_alvo\") | .email" "$snap" 2>/dev/null || echo "")
-  rm -f "$snap" 2>/dev/null || true
-
-  if [ -n "$email_dest" ] && [ "$email_dest" != "null" ]; then
-    nova=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 10)
-    echo "$user_alvo:$nova" | chpasswd
-
-    # Atualiza DB (senha plain para compat) sob lock + atomic
-    snap="$(db_snapshot)"
-    local tmp
-    tmp="$(mktemp)"
-    jq -c "if .usuario==\"$user_alvo\" then .senha=\"$nova\" else . end" "$snap" > "$tmp" 2>/dev/null || true
-    rm -f "$snap" 2>/dev/null || true
-    db_replace_atomic "$tmp"
-    autocura_db_users
-
-    echo -e "Subject: Nova Senha PMESP\n\nSenha: $nova" | msmtp "$email_dest" || true
-    echo -e "${G}Senha enviada!${NC}"
-  else
-    echo -e "${R}Email não encontrado ou usuário inválido.${NC}"
-  fi
-  pause
-}
-
-atualizar_hwid(){
+atualizar_hwid_inner(){
   selecionar_usuario_lista || return
   read -r -p "Novo HWID: " h
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
 
-  local snap tmp
-  snap="$(db_snapshot)"
+  if ! have jq; then
+    echo -e "${R}jq não instalado.${NC}"
+    pause; return
+  fi
+
+  local tmp
   tmp="$(mktemp)"
-  jq -c "if .usuario == \"$USER_ALVO\" then .hwid = \"$h\" else . end" "$snap" > "$tmp" 2>/dev/null || true
-  rm -f "$snap" 2>/dev/null || true
+  jq -c "if .usuario == \"$USER_ALVO\" then .hwid = \"$h\" else . end" "$DB_PMESP" > "$tmp"
+  mv "$tmp" "$DB_PMESP"
 
-  db_replace_atomic "$tmp"
-  autocura_db_users
-
-  echo -e "${G}HWID atualizado!${NC}"
+  msg_ok "HWID atualizado!"
   sleep 2
 }
 
-# ------------------------------------------------------------
-# SUPORTE E SISTEMA
-# ------------------------------------------------------------
-novo_chamado(){
+atualizar_hwid(){
+  with_lock atualizar_hwid_inner
+}
+
+novo_chamado_inner(){
   cabecalho
-  have jq || { echo -e "${R}jq não instalado.${NC}"; pause; return; }
+  if ! have jq; then
+    echo -e "${R}jq não instalado.${NC}"
+    pause; return
+  fi
 
   local ID u p
   ID=$((1000 + RANDOM % 8999))
@@ -484,8 +423,12 @@ novo_chamado(){
   jq -n --arg i "$ID" --arg u "$u" --arg p "$p" --arg s "ABERTO" --arg d "$(date)" \
     '{id:$i, usuario:$u, problema:$p, status:$s, data:$d}' -c >> "$DB_CHAMADOS"
 
-  echo -e "${G}Chamado #$ID criado.${NC}"
+  msg_ok "Chamado #$ID criado."
   sleep 2
+}
+
+novo_chamado(){
+  with_lock novo_chamado_inner
 }
 
 gerenciar_chamados(){
@@ -516,15 +459,15 @@ password $s
 account default : gmail
 EOF
   chmod 600 "$CONFIG_SMTP"
-  echo -e "${G}SMTP Configurado!${NC}"
+  msg_ok "SMTP Configurado!"
   sleep 2
 }
 
 install_deps(){
   cabecalho
   apt update || true
-  apt install -y jq msmtp msmtp-mta net-tools wget curl openssl ca-certificates bc screen nano lsof cron zip unzip
-  echo -e "${G}Dependências Instaladas!${NC}"
+  apt install -y jq msmtp msmtp-mta net-tools wget curl openssl ca-certificates bc screen nano lsof cron zip unzip sslh squid stunnel4
+  msg_ok "Dependências Instaladas!"
   sleep 2
 }
 
@@ -537,7 +480,7 @@ acl all src 0.0.0.0/0
 http_access allow all
 EOF
   systemctl restart squid
-  echo -e "${G}Squid Ativo na 3128!${NC}"
+  msg_ok "Squid Ativo na 3128!"
   sleep 2
 }
 
@@ -546,16 +489,16 @@ install_sslh(){
   apt install -y sslh >/dev/null
   echo 'DAEMON_OPTS="--user sslh --listen 0.0.0.0:443 --ssh 127.0.0.1:22"' > /etc/default/sslh
   systemctl restart sslh
-  echo -e "${G}SSLH Ativo na 443!${NC}"
+  msg_ok "SSLH Ativo na 443!"
   sleep 2
 }
 
 configurar_cron_monitor(){
   cabecalho
   local p
-  p=$(readlink -f "$0")
+  p="$(readlink -f "$0")"
   (crontab -l 2>/dev/null | grep -v "pmesp --cron-monitor" || true; echo "*/1 * * * * /bin/bash $p --cron-monitor >/dev/null 2>&1") | crontab -
-  echo -e "${G}Monitoramento Cron Ativado!${NC}"
+  msg_ok "Monitoramento Cron Ativado!"
   sleep 2
 }
 
@@ -565,7 +508,7 @@ configurar_cron_monitor(){
 
 download_chisel_latest(){
   apt update || true
-  apt install -y curl ca-certificates
+  apt install -y curl ca-certificates gzip
 
   local arch asset api url tmpdir
   arch="$(uname -m)"
@@ -573,12 +516,12 @@ download_chisel_latest(){
     x86_64|amd64) asset="linux_amd64" ;;
     aarch64|arm64) asset="linux_arm64" ;;
     armv7l|armhf) asset="linux_armv7" ;;
-    *) echo -e "${R}Arch não suportada: $arch${NC}"; return 1 ;;
+    *) msg_fail "Arch não suportada: $arch"; return 1 ;;
   esac
 
   api="https://api.github.com/repos/jpillora/chisel/releases/latest"
   url="$(curl -fsSL "$api" | sed -n 's/.*"browser_download_url": "\(.*'"$asset"'.*\.gz\)".*/\1/p' | head -n1)"
-  [ -n "${url:-}" ] || { echo -e "${R}Falha ao localizar release do chisel.${NC}"; return 1; }
+  [ -n "${url:-}" ] || { msg_fail "Falha ao localizar release do chisel."; return 1; }
 
   tmpdir="$(mktemp -d)"
   curl -fsSL "$url" -o "$tmpdir/chisel.gz"
@@ -586,7 +529,7 @@ download_chisel_latest(){
   chmod +x "$tmpdir/chisel"
   mv "$tmpdir/chisel" "$CHISEL_BIN"
   rm -rf "$tmpdir"
-  echo -e "${G}Chisel instalado em ${W}$CHISEL_BIN${NC}"
+  msg_ok "Chisel instalado em $CHISEL_BIN"
 }
 
 install_chisel_server(){
@@ -604,7 +547,7 @@ install_chisel_server(){
 
   cat > "$CHISEL_SERVICE" <<EOF
 [Unit]
-Description=Chisel Server (PMESP Tank Mode)
+Description=Chisel Server (PMESP)
 After=network-online.target
 Wants=network-online.target
 
@@ -624,10 +567,8 @@ EOF
   systemctl enable chisel >/dev/null 2>&1 || true
   systemctl restart chisel
 
-  echo -e "${G}CHISEL OK.${NC}"
-  echo -e "${Y}Porta:${NC} ${W}${ch_port}${NC}"
-  echo -e "${Y}Auth :${NC} ${W}${ch_auth}${NC}"
-  echo -e "${Y}Log  :${NC} ${W}tail -n 80 ${CHISEL_LOG}${NC}"
+  msg_ok "CHISEL OK - Porta: ${ch_port} | Auth: ${ch_auth}"
+  msg_ok "Log: tail -n 80 ${CHISEL_LOG}"
   sleep 2
 }
 
@@ -637,7 +578,7 @@ status_chisel(){
   barra
   systemctl status chisel --no-pager || true
   echo ""
-  ss -lntp | egrep ':443|:1080' || true
+  ss -lntp | egrep ':443|:1080|:8080' || true
   echo ""
   tail -n 60 "$CHISEL_LOG" 2>/dev/null || true
   pause
@@ -654,7 +595,7 @@ remove_chisel(){
   rm -f "$CHISEL_SERVICE" 2>/dev/null || true
   systemctl daemon-reload || true
   rm -f "$CHISEL_BIN" 2>/dev/null || true
-  echo -e "${G}Chisel removido.${NC}"
+  msg_ok "Chisel removido."
   sleep 2
 }
 
@@ -679,7 +620,7 @@ install_stunnel_server(){
   if [[ ! -f "$STUNNEL_CERT" ]]; then
     openssl req -new -x509 -days 3650 -nodes \
       -out "$STUNNEL_CERT" -keyout "$STUNNEL_CERT" \
-      -subj "/C=BR/ST=SP/L=SP/O=PMESP-Tank/CN=tank.local"
+      -subj "/C=BR/ST=SP/L=SP/O=PMESP/CN=pmesp.local" >/dev/null 2>&1
     chmod 600 "$STUNNEL_CERT"
   fi
 
@@ -702,19 +643,10 @@ EOF
     grep -q '^ENABLED=' /etc/default/stunnel4 || echo 'ENABLED=1' >> /etc/default/stunnel4
   fi
 
-  mkdir -p /etc/systemd/system/stunnel4.service.d
-  cat > /etc/systemd/system/stunnel4.service.d/override.conf <<'EOF'
-[Service]
-Restart=always
-RestartSec=3
-EOF
-
-  systemctl daemon-reload
   systemctl enable stunnel4 >/dev/null 2>&1 || true
   systemctl restart stunnel4
 
-  echo -e "${G}STUNNEL OK.${NC}"
-  echo -e "${Y}TLS:${NC} ${W}${tls_port}${NC}  ->  ${W}${fhost}:${fport}${NC}"
+  msg_ok "STUNNEL OK - TLS ${tls_port} -> ${fhost}:${fport}"
   sleep 2
 }
 
@@ -724,7 +656,7 @@ status_stunnel(){
   barra
   systemctl status stunnel4 --no-pager || true
   echo ""
-  ss -lntp | egrep ':443|:1080|:8443' || true
+  ss -lntp | egrep ':443|:8443' || true
   echo ""
   tail -n 60 "$STUNNEL_LOG" 2>/dev/null || true
   pause
@@ -738,11 +670,9 @@ remove_stunnel(){
   [[ "${c:-}" =~ ^[sS]$ ]] || return
   systemctl stop stunnel4 2>/dev/null || true
   systemctl disable stunnel4 2>/dev/null || true
-  rm -rf /etc/systemd/system/stunnel4.service.d 2>/dev/null || true
-  systemctl daemon-reload || true
   apt purge -y stunnel4 2>/dev/null || true
   apt autoremove -y 2>/dev/null || true
-  echo -e "${G}Stunnel removido.${NC}"
+  msg_ok "Stunnel removido."
   sleep 2
 }
 
@@ -773,7 +703,6 @@ tunnel_arsenal(){
   done
 }
 
-# --- MENU ---
 menu(){
   while true; do
     cabecalho
@@ -785,8 +714,9 @@ menu(){
     echo -e "${C}┃ ${G}06${W} ⮞ USUÁRIOS VENCIDOS        ${C}┃ ${G}14${W} ⮞ INSTALAR SSLH${NC}"
     echo -e "${C}┃ ${G}07${W} ⮞ MONITOR ONLINE           ${C}┃ ${G}15${W} ⮞ ATIVAR CRON${NC}"
     echo -e "${C}┃ ${G}08${W} ⮞ VINCULAR HWID            ${C}┃ ${G}16${W} ⮞ TUNNEL ARSENAL${NC}"
-    echo -e "${C}┃ ${G}17${W} ⮞ STATUS API TÁTICA         ${C}┃ ${R}00${W} ⮞ SAIR${NC}"
+    echo -e "${C}┃ ${R}00${W} ⮞ SAIR${NC}"
     echo -e "${C}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+
     read -r -p "➤ Opção: " op
     case "$op" in
       1|01) criar_usuario ;;
@@ -805,7 +735,6 @@ menu(){
       14) install_sslh ;;
       15) configurar_cron_monitor ;;
       16) tunnel_arsenal ;;
-      17) status_api_tatica ;;
       0|00) exit 0 ;;
       *) echo -e "${R}Opção Inválida!${NC}"; sleep 1 ;;
     esac
