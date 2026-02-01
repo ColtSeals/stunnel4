@@ -12,8 +12,6 @@ app = FastAPI(title="PMESP API")
 DB_PATH = "/etc/pmesp_users.json"
 LOCK_PATH = "/var/lock/pmesp_db.lock"
 
-# Se você definir esta env var no Linux, a API passa a exigir header:
-# export PMESP_API_KEY="SUA_CHAVE_FORTE"
 API_KEY = os.getenv("PMESP_API_KEY", "").strip()
 
 class TrocaSenha(BaseModel):
@@ -26,31 +24,15 @@ def require_api_key(x_api_key: Optional[str]):
         if not x_api_key or x_api_key.strip() != API_KEY:
             raise HTTPException(status_code=401, detail="API key inválida")
 
-def _ensure_lockfile():
+def _lock_exclusive():
     os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
-    if not os.path.exists(LOCK_PATH):
-        with open(LOCK_PATH, "w", encoding="utf-8"):
-            pass
-
-def with_lock_exclusive():
-    _ensure_lockfile()
-    lockf = open(LOCK_PATH, "w", encoding="utf-8")
-    fcntl.flock(lockf, fcntl.LOCK_EX)
-    return lockf
-
-def with_lock_shared():
-    _ensure_lockfile()
-    lockf = open(LOCK_PATH, "r", encoding="utf-8")
-    fcntl.flock(lockf, fcntl.LOCK_SH)
-    return lockf
+    lf = open(LOCK_PATH, "w")
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    return lf
 
 def carregar_db() -> List[Dict[str, Any]]:
     users: List[Dict[str, Any]] = []
-    if not os.path.exists(DB_PATH):
-        return users
-
-    lockf = with_lock_shared()
-    try:
+    if os.path.exists(DB_PATH):
         with open(DB_PATH, "r", encoding="utf-8") as f:
             for linha in f:
                 linha = linha.strip()
@@ -62,24 +44,12 @@ def carregar_db() -> List[Dict[str, Any]]:
                         users.append(obj)
                 except Exception:
                     continue
-    finally:
-        fcntl.flock(lockf, fcntl.LOCK_UN)
-        lockf.close()
-
-    # unique por usuario (segurança extra)
-    seen = set()
-    uniq = []
-    for u in users:
-        key = u.get("usuario")
-        if key and key not in seen:
-            seen.add(key)
-            uniq.append(u)
-    return uniq
+    return users
 
 def salvar_db(users: List[Dict[str, Any]]):
-    lockf = with_lock_exclusive()
+    # escrita atômica com lock
+    lockf = _lock_exclusive()
     try:
-        # escreve atomico
         tmp_path = DB_PATH + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             for u in users:
@@ -90,19 +60,15 @@ def salvar_db(users: List[Dict[str, Any]]):
         lockf.close()
 
 def validar_senha(user: Dict[str, Any], senha_informada: str) -> bool:
-    # Novo padrão: senha_hash (bcrypt)
     senha_hash = user.get("senha_hash")
     if senha_hash:
         try:
             return bcrypt.verify(senha_informada, senha_hash)
         except Exception:
             return False
-
-    # Legado: senha em texto (compatibilidade)
     senha_plain = user.get("senha")
     if senha_plain:
         return senha_plain == senha_informada
-
     return False
 
 def set_senha_linux(usuario: str, nova_senha: str):
@@ -118,7 +84,14 @@ def set_senha_linux(usuario: str, nova_senha: str):
 @app.get("/me/{username}")
 async def ver_meus_dados(username: str, x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
-    users = carregar_db()
+
+    lockf = _lock_exclusive()
+    try:
+        users = carregar_db()
+    finally:
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+        lockf.close()
+
     u = next((user for user in users if user.get("usuario") == username), None)
     if not u:
         raise HTTPException(status_code=404, detail="Não encontrado")
@@ -138,21 +111,24 @@ async def mudar_senha(d: TrocaSenha, x_api_key: Optional[str] = Header(default=N
     if len(d.nova_senha) < 8:
         raise HTTPException(status_code=400, detail="Nova senha fraca (mínimo 8 caracteres)")
 
-    users = carregar_db()
-    for u in users:
-        if u.get("usuario") == d.usuario:
-            if not validar_senha(u, d.senha_atual):
-                raise HTTPException(status_code=403, detail="Senha atual incorreta")
+    lockf = _lock_exclusive()
+    try:
+        users = carregar_db()
 
-            set_senha_linux(d.usuario, d.nova_senha)
+        for u in users:
+            if u.get("usuario") == d.usuario:
+                if not validar_senha(u, d.senha_atual):
+                    raise HTTPException(status_code=403, detail="Senha atual incorreta")
 
-            # bcrypt vira padrão definitivo
-            u["senha_hash"] = bcrypt.hash(d.nova_senha)
+                set_senha_linux(d.usuario, d.nova_senha)
 
-            # compatibilidade (se quiser HARDENING: remova essa linha)
-            u["senha"] = d.nova_senha
+                u["senha_hash"] = bcrypt.hash(d.nova_senha)
+                u["senha"] = d.nova_senha  # se quiser mais segurança, remova depois
 
-            salvar_db(users)
-            return {"status": "sucesso"}
+                salvar_db(users)
+                return {"status": "sucesso"}
 
-    raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    finally:
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+        lockf.close()
