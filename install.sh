@@ -1,36 +1,45 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-echo -e "\033[1;34m>>> PMESP ULTIMATE - INSTALL (V9.2)\033[0m"
+echo -e "\033[1;34m>>> PMESP ULTIMATE - INSTALL (V8.5 TANK)\033[0m"
 
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ColtSeals/stunnel4/main}"
 
 apt-get update -y || true
 apt-get install -y \
-  jq python3 python3-pip wget curl msmtp msmtp-mta ca-certificates bc \
-  screen nano net-tools lsof cron zip unzip openssl gzip \
-  squid sslh stunnel4
+  bash jq curl wget gzip ca-certificates openssl \
+  net-tools lsof cron screen nano zip unzip \
+  stunnel4 sslh squid \
+  python3 python3-pip \
+  msmtp msmtp-mta
 
 # API deps
-pip3 install fastapi uvicorn "passlib[bcrypt]" --break-system-packages 2>/dev/null \
-  || pip3 install fastapi uvicorn "passlib[bcrypt]"
+python3 -m pip install --upgrade pip >/dev/null 2>&1 || true
+python3 -m pip install fastapi uvicorn "passlib[bcrypt]" >/dev/null 2>&1 || true
 
-# Manager
+# Baixa manager (pmesp)
 wget -qO /usr/local/bin/pmesp "$REPO_RAW/manager.sh"
 chmod +x /usr/local/bin/pmesp
 
-# API
-mkdir -p /etc/pmesp /var/lock
+# Normaliza possível CRLF (Windows) pra evitar "pmesp volta pro prompt"
+sed -i 's/\r$//' /usr/local/bin/pmesp || true
+
+# Baixa API
+mkdir -p /etc/pmesp
 wget -qO /etc/pmesp/api_pmesp.py "$REPO_RAW/api_pmesp.py"
+sed -i 's/\r$//' /etc/pmesp/api_pmesp.py || true
 
-# Arquivos base + permissões
-touch /etc/pmesp_users.json /etc/pmesp_tickets.json /var/lock/pmesp_db.lock
-chmod 666 /etc/pmesp_users.json /etc/pmesp_tickets.json /var/lock/pmesp_db.lock
+# Banco e lock
+touch /etc/pmesp_users.json /etc/pmesp_tickets.json
+chmod 666 /etc/pmesp_users.json /etc/pmesp_tickets.json
+mkdir -p /var/lock
+touch /var/lock/pmesp_db.lock
+chmod 666 /var/lock/pmesp_db.lock
 
-# Serviço API (auto-start)
+# Serviço API (auto-start) - usa python -m uvicorn (não depende de /usr/local/bin/uvicorn)
 cat > /etc/systemd/system/pmesp-api.service <<'EOF'
 [Unit]
-Description=API PMESP (FastAPI)
+Description=PMESP API (FastAPI)
 After=network.target
 
 [Service]
@@ -46,8 +55,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable pmesp-api.service
-systemctl restart pmesp-api.service
+systemctl enable pmesp-api.service >/dev/null 2>&1 || true
+systemctl restart pmesp-api.service || true
 
-echo -e "\033[1;32m>>> TUDO PRONTO! Digite 'pmesp' para abrir.\033[0m"
+echo -e "\033[1;32m>>> OK! Digite: pmesp\033[0m"
 echo -e "\033[1;33m>>> API: http://IP_DA_VPS:8000/docs\033[0m"
